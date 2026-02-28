@@ -1,0 +1,55 @@
+const { getTransaction, updateTransaction } = require('../lib/store');
+const { sendEmail } = require('../lib/email');
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ message: 'Method not allowed' });
+  }
+
+  try {
+    const { stkCallback } = req.body.Body;
+    const { CheckoutRequestID, ResultCode, ResultDesc } = stkCallback;
+
+    const tx = await getTransaction(CheckoutRequestID);
+
+    if (ResultCode === 0) {
+      const meta = {};
+      (stkCallback.CallbackMetadata?.Item || []).forEach(i => {
+        meta[i.Name] = i.Value;
+      });
+
+      if (tx) {
+        await updateTransaction(CheckoutRequestID, {
+          status: 'completed',
+          mpesaReceiptNumber: meta.MpesaReceiptNumber,
+          completedAt: new Date().toISOString(),
+        });
+
+        await sendEmail({
+          to_email: tx.email,
+          to_name:  tx.userName,
+          subject:  'Deposit Confirmed — CryptoPro',
+          amount:   `$${tx.amount}`,
+          receipt:  meta.MpesaReceiptNumber,
+        });
+
+        console.log(`✅ Payment confirmed: ${meta.MpesaReceiptNumber}`);
+      }
+
+    } else {
+      if (tx) {
+        await updateTransaction(CheckoutRequestID, {
+          status: 'failed',
+          errorMessage: ResultDesc,
+        });
+      }
+      console.log(`❌ Payment failed: ${ResultDesc}`);
+    }
+
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+
+  } catch (err) {
+    console.error('❌ Callback error:', err.message);
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  }
+};
