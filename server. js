@@ -1,0 +1,361 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+
+const app = express();
+
+// ── Middleware ──────────────────────────────
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production'
+    ? ['https://your-domain.vercel.app']
+    : '*'
+}));
+app.use(express.json({ limit: '10mb' }));
+
+// ── Config (all from env) ───────────────────
+const MPESA = {
+  CONSUMER_KEY:        process.env.MPESA_CONSUMER_KEY,
+  CONSUMER_SECRET:     process.env.MPESA_CONSUMER_SECRET,
+  PASSKEY:             process.env.MPESA_PASSKEY,
+  BUSINESS_SHORT_CODE: process.env.MPESA_BUSINESS_SHORT_CODE,
+  TILL_NUMBER:         process.env.MPESA_TILL_NUMBER,
+  PHONE_NUMBER:        process.env.MPESA_PHONE_NUMBER,
+  CALLBACK_URL:        process.env.CALLBACK_URL,
+  AUTH_URL: process.env.MPESA_ENV === 'production'
+    ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
+    : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+  STK_URL: process.env.MPESA_ENV === 'production'
+    ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
+    : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+};
+
+const BANK = {
+  NAME:           process.env.BANK_NAME,
+  ACCOUNT_NUMBER: process.env.BANK_ACCOUNT_NUMBER,
+  ACCOUNT_NAME:   process.env.BANK_ACCOUNT_NAME,
+};
+
+const WALLETS = {
+  BTC:         process.env.WALLET_BTC,
+  ETH:         process.env.WALLET_ETH,
+  'USDT-ERC20': process.env.WALLET_USDT_ERC20,
+  'USDT-TRC20': process.env.WALLET_USDT_TRC20,
+};
+
+// ── In-memory store (swap for DB in production) ──
+const transactions = new Map();
+
+// ── Helpers ─────────────────────────────────
+async function getMpesaToken() {
+  const auth = Buffer.from(`${MPESA.CONSUMER_KEY}:${MPESA.CONSUMER_SECRET}`).toString('base64');
+  const { data } = await axios.get(MPESA.AUTH_URL, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  return data.access_token;
+}
+
+function generateMpesaPassword() {
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
+  const password = Buffer.from(
+    `${MPESA.BUSINESS_SHORT_CODE}${MPESA.PASSKEY}${timestamp}`
+  ).toString('base64');
+  return { password, timestamp };
+}
+
+function formatPhone(phone) {
+  let p = phone.replace(/\+|\s/g, '');
+  if (p.startsWith('0')) p = '254' + p.slice(1);
+  if (!p.startsWith('254')) p = '254' + p;
+  return p;
+}
+
+async function sendEmail(data) {
+  try {
+    // Using EmailJS REST API
+    await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
+      service_id:  process.env.EMAILJS_SERVICE_ID,
+      template_id: process.env.EMAILJS_TEMPLATE_ID,
+      user_id:     process.env.EMAILJS_PUBLIC_KEY,
+      accessToken: process.env.EMAILJS_PRIVATE_KEY,
+      template_params: data,
+    });
+    console.log('📧 Email sent to:', data.to_email);
+  } catch (err) {
+    console.error('❌ Email failed:', err.message);
+  }
+}
+
+function adminAuth(req, res, next) {
+  const token = req.headers['x-admin-secret'];
+  if (token !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
+  next();
+}
+
+// ── Routes ───────────────────────────────────
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'CryptoPro Payment Server',
+    version: '1.0.0',
+    env: process.env.NODE_ENV,
+    mpesa_env: process.env.MPESA_ENV,
+    timestamp: new Date().toISOString(),
+    transactions: transactions.size,
+  });
+});
+
+// Payment methods (public info only — no secrets)
+app.get('/api/payment-methods', (req, res) => {
+  res.json({
+    success: true,
+    methods: {
+      mpesa: {
+        available: true,
+        name: 'M-Pesa',
+        description: 'Instant mobile payment',
+      },
+      crypto: {
+        available: true,
+        name: 'Cryptocurrency',
+        currencies: Object.keys(WALLETS),
+        addresses: WALLETS, // wallets are public receive addresses — safe to expose
+      },
+      bank: {
+        available: true,
+        name: BANK.NAME,
+        accountName: BANK.ACCOUNT_NAME,
+        accountNumber: BANK.ACCOUNT_NUMBER,
+      },
+    },
+  });
+});
+
+// M-Pesa STK Push
+app.post('/api/mpesa-payment', async (req, res) => {
+  try {
+    const { phoneNumber, amount, email, userName } = req.body;
+
+    if (!phoneNumber || !amount) {
+      return res.status(400).json({ success: false, message: 'Phone and amount required' });
+    }
+
+    const phone     = formatPhone(phoneNumber);
+    const kesAmount = Math.ceil(parseFloat(amount) * 130);
+    const token     = await getMpesaToken();
+    const { password, timestamp } = generateMpesaPassword();
+
+    const payload = {
+      BusinessShortCode: MPESA.BUSINESS_SHORT_CODE,
+      Password:          password,
+      Timestamp:         timestamp,
+      TransactionType:   'CustomerPayBillOnline',
+      Amount:            kesAmount,
+      PartyA:            phone,
+      PartyB:            MPESA.BUSINESS_SHORT_CODE,
+      PhoneNumber:       phone,
+      CallBackURL:       MPESA.CALLBACK_URL,
+      AccountReference:  'CryptoPro',
+      TransactionDesc:   `Deposit $${amount}`,
+    };
+
+    const { data } = await axios.post(MPESA.STK_URL, payload, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const txId = data.CheckoutRequestID;
+    transactions.set(txId, {
+      email, userName, amount, kesAmount,
+      phoneNumber: phone,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    });
+
+    console.log(`✅ STK Push sent — ${phone} — KES ${kesAmount}`);
+
+    res.json({
+      success: true,
+      message: 'STK Push sent. Check your phone.',
+      checkoutRequestID: txId,
+      merchantRequestID: data.MerchantRequestID,
+    });
+
+  } catch (err) {
+    console.error('❌ STK Push error:', err.response?.data || err.message);
+    res.status(500).json({
+      success: false,
+      message: err.response?.data?.errorMessage || 'Failed to initiate payment',
+    });
+  }
+});
+
+// M-Pesa Callback
+app.post('/api/mpesa-callback', async (req, res) => {
+  try {
+    const { stkCallback } = req.body.Body;
+    const { CheckoutRequestID, ResultCode, ResultDesc } = stkCallback;
+    const tx = transactions.get(CheckoutRequestID);
+
+    if (ResultCode === 0) {
+      const meta = {};
+      (stkCallback.CallbackMetadata?.Item || []).forEach(i => { meta[i.Name] = i.Value; });
+
+      if (tx) {
+        tx.status = 'completed';
+        tx.mpesaReceiptNumber = meta.MpesaReceiptNumber;
+        tx.completedAt = new Date().toISOString();
+        transactions.set(CheckoutRequestID, tx);
+
+        await sendEmail({
+          to_email: tx.email,
+          to_name:  tx.userName,
+          subject:  'Deposit Confirmed — CryptoPro',
+          amount:   `$${tx.amount}`,
+          receipt:  meta.MpesaReceiptNumber,
+        });
+
+        console.log(`✅ Payment confirmed — receipt: ${meta.MpesaReceiptNumber}`);
+      }
+    } else {
+      console.log(`❌ Payment failed: ${ResultDesc}`);
+      if (tx) {
+        tx.status = 'failed';
+        tx.errorMessage = ResultDesc;
+        transactions.set(CheckoutRequestID, tx);
+      }
+    }
+
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+
+  } catch (err) {
+    console.error('❌ Callback error:', err.message);
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  }
+});
+
+// Check payment status
+app.get('/api/check-payment/:id', (req, res) => {
+  const tx = transactions.get(req.params.id);
+  if (!tx) return res.json({ success: false, status: 'not_found' });
+
+  res.json({
+    success: true,
+    status: tx.status,
+    message: tx.status === 'completed' ? 'Payment verified' :
+             tx.status === 'failed'    ? 'Payment failed'   : 'Pending',
+    transaction: {
+      amount:             tx.amount,
+      kesAmount:          tx.kesAmount,
+      mpesaReceiptNumber: tx.mpesaReceiptNumber || null,
+    },
+  });
+});
+
+// Crypto payment submission
+app.post('/api/crypto-payment', async (req, res) => {
+  try {
+    const { email, userName, amount, cryptoType, txHash } = req.body;
+
+    const paymentId = 'CRYPTO-' + Date.now();
+    transactions.set(paymentId, {
+      type: 'crypto', email, userName,
+      amount, cryptoType, txHash,
+      status: 'pending_verification',
+      createdAt: new Date().toISOString(),
+    });
+
+    await sendEmail({
+      to_email: process.env.ADMIN_EMAIL,
+      to_name:  'Admin',
+      subject:  'New Crypto Payment — Verify Required',
+      amount:   `$${amount}`,
+      extra:    `Type: ${cryptoType} | TxHash: ${txHash} | User: ${userName}`,
+    });
+
+    res.json({ success: true, message: 'Submitted for verification', paymentId });
+
+  } catch (err) {
+    console.error('❌ Crypto payment error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to process' });
+  }
+});
+
+// Bank transfer submission
+app.post('/api/bank-payment', async (req, res) => {
+  try {
+    const { email, userName, amount, reference } = req.body;
+
+    const paymentId = 'BANK-' + Date.now();
+    transactions.set(paymentId, {
+      type: 'bank', email, userName,
+      amount, reference,
+      status: 'pending_verification',
+      createdAt: new Date().toISOString(),
+    });
+
+    await sendEmail({
+      to_email: process.env.ADMIN_EMAIL,
+      to_name:  'Admin',
+      subject:  'New Bank Transfer — Verify Required',
+      amount:   `$${amount}`,
+      extra:    `Reference: ${reference} | User: ${userName} (${email})`,
+    });
+
+    res.json({ success: true, message: 'Bank transfer submitted', paymentId });
+
+  } catch (err) {
+    console.error('❌ Bank payment error:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to process' });
+  }
+});
+
+// Admin — view all transactions (protected)
+app.get('/api/admin/transactions', adminAuth, (req, res) => {
+  const all = Array.from(transactions.entries()).map(([id, data]) => ({ id, ...data }));
+  res.json({ success: true, count: all.length, transactions: all });
+});
+
+// Admin — manually approve a pending transaction
+app.post('/api/admin/approve/:id', adminAuth, async (req, res) => {
+  const tx = transactions.get(req.params.id);
+  if (!tx) return res.status(404).json({ success: false, message: 'Not found' });
+
+  tx.status = 'completed';
+  tx.approvedAt = new Date().toISOString();
+  transactions.set(req.params.id, tx);
+
+  await sendEmail({
+    to_email: tx.email,
+    to_name:  tx.userName,
+    subject:  'Deposit Approved — CryptoPro',
+    amount:   `$${tx.amount}`,
+    extra:    'Your deposit has been verified and credited to your account.',
+  });
+
+  res.json({ success: true, message: 'Transaction approved' });
+});
+
+// ── Start ────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════════╗
+║   CryptoPro Payment Server               ║
+║   Port    : ${PORT}                          ║
+║   Mode    : ${process.env.NODE_ENV}              ║
+║   M-Pesa  : ${process.env.MPESA_ENV}                  ║
+╚══════════════════════════════════════════╝
+  `);
+});
+
+process.on('unhandledRejection', err => console.error('❌ Unhandled:', err));
+process.on('uncaughtException',  err => { console.error('❌ Uncaught:', err); process.exit(1); });
+
+module.exports = app;
